@@ -52,14 +52,16 @@
 		<div id="debug"></div>
 
 		<!-- Three.js (stable pinned) -->
-		<script src="https://unpkg.com/three@0.152.2/build/three.min.js"></script>
+		<!-- NOTE: build/three.min.js is deprecated in r150+. We will import the ES module version inside the main app script. -->
 
 		<!-- MediaPipe resources (locked to required version on unpkg) -->
 		<script src="https://unpkg.com/@mediapipe/hands@0.4.1646424915/hands.js"></script>
 		<script src="https://unpkg.com/@mediapipe/camera_utils@0.4.1646424915/camera_utils.js"></script>
 		<script src="https://unpkg.com/@mediapipe/drawing_utils@0.4.1646424915/drawing_utils.js"></script>
 
-		<script>
+		<script type="module">
+			// Import three.js as an ES module so we avoid using deprecated builds
+			import * as THREE from 'https://unpkg.com/three@0.152.2/build/three.module.js';
 			// ==========================
 			// Configuration / constants
 			// ==========================
@@ -78,17 +80,28 @@
 			// ====================
 			// Safety: wait model
 			// ====================
+			// Base used by MediaPipe locateFile; prefer local ./mediapipe/ directory (avoid CORS), otherwise fall back to unpkg
+			let MEDIAPIPE_ASSET_BASE = null;
+
 			async function ensureMediaPipeReady(){
-				// Try fetching key assets from the unpkg release to avoid runtime WASM mismatch.
-				const base = `https://unpkg.com/@mediapipe/hands@${MEDIAPIPE_VERSION}/`;
+				// Try fetching key assets from a local 'mediapipe' directory first to avoid CORS issues when fetching wasm from unpkg
+				const localBase = './mediapipe/';
+				const remoteBase = `https://unpkg.com/@mediapipe/hands@${MEDIAPIPE_VERSION}/`;
 				const list = ['hands.js','hands_solution_packed_assets.data','hands_cpu.wasm'];
 				let progress = 0;
 				setLoading(5, '预热下载...');
+				let foundLocal = 0;
 				for(const f of list){
 					try{
-						setLoading(progress+5, `Fetching ${f}`);
-						// attempt to download HEAD/content. We'll use a ranged fetch to test availability.
-						const res = await fetch(base + f, {method:'GET'});
+						setLoading(progress+5, `Checking local ${f}`);
+						const r = await fetch(localBase + f, {method:'HEAD'});
+						if(r.ok) foundLocal++;
+					}catch(e){ /* ignore - file not available locally */ }
+
+					try{
+						setLoading(progress+5, `Fetching remote ${f}`);
+						// attempt to download HEAD/content from remote to verify availability.
+						const res = await fetch(remoteBase + f, {method:'GET'});
 						if(!res.ok) throw new Error('资源无法获取: '+f);
 					}catch(err){
 						console.warn('准备资源失败', f, err);
@@ -96,6 +109,9 @@
 					}
 					progress += 30;
 				}
+				// If most assets found locally, prefer local assets to avoid CORS and speed up load
+				MEDIAPIPE_ASSET_BASE = (foundLocal >= 2) ? localBase : remoteBase;
+
 				setLoading(100,'模型资源准备完毕 — 准备启动摄像头');
 				await new Promise(r => setTimeout(r, 400));
 			}
@@ -110,7 +126,17 @@
 
 					// Camera setup
 					status.textContent = '请求摄像头权限...';
-					const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}, audio:false});
+					let stream;
+					try{
+						stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}, audio:false});
+					}catch(deviceErr){
+						console.error('Camera acquisition failed', deviceErr);
+						// Provide a clear user message rather than letting a raw NotFoundError bubble up
+						document.getElementById('status').textContent = '无法访问摄像头 — 请检查摄像头是否连接并允许权限。';
+						setLoading(100,'需要摄像头才能运行');
+						// hide the overlay only after user acknowledges, but for now stop startup
+						return;
+					}
 
 					// create a hidden video element
 					const video = document.createElement('video');
@@ -202,7 +228,7 @@
 					// Setup MediaPipe Hands
 					// The library was loaded from unpkg; ensure locateFile points to same version
 					const hands = new Hands({
-						locateFile: (file) => `https://unpkg.com/@mediapipe/hands@${MEDIAPIPE_VERSION}/${file}`
+						locateFile: (file) => `${MEDIAPIPE_ASSET_BASE}${file}`
 					});
 
 					hands.setOptions({
