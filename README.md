@@ -32,6 +32,9 @@ npx serve -s -l 8000 .
 
 Notes:
 - The app prefers local `./mediapipe/` files to avoid the CORS error you saw when fetching `hands_cpu.wasm` from unpkg.
+ - The app prefers local `./mediapipe/` files to avoid the CORS error you saw when fetching `hands_cpu.wasm` from unpkg. If local files are missing the app now tries a secondary CDN (jsDelivr) before warning and suggesting local download.
+ - Added a small inline favicon so browsers won't request `/favicon.ico` and produce a 404 in the console.
+ - The initial HUD bug ("Cannot access 'enemyCount' before initialization") has been fixed by ensuring UI DOM references are created before spawning enemies.
 - The project now imports three.js using the ES Modules build to avoid deprecation warnings.
 - If the browser cannot access a camera, the app will show a friendly status message. Make sure a camera is connected and permissions are granted.
 

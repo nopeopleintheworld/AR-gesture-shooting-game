@@ -4,6 +4,8 @@
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width,initial-scale=1" />
 		<title>AR 手势射击（单文件）</title>
+		<!-- small inline SVG favicon to avoid 404 on /favicon.ico -->
+		<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%230b84ff'/%3E%3Ctext x='50%25' y='55%25' font-size='9' text-anchor='middle' fill='white' font-family='system-ui,Segoe UI,Arial'%3EAR%3C/text%3E%3C/svg%3E">
 		<style>
 			html,body{height:100%;margin:0;overflow:hidden;background:#111;color:#fff;font-family:system-ui,Segoe UI,Arial}
 			#container{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
@@ -54,10 +56,10 @@
 		<!-- Three.js (stable pinned) -->
 		<!-- NOTE: build/three.min.js is deprecated in r150+. We will import the ES module version inside the main app script. -->
 
-		<!-- MediaPipe resources (locked to required version on unpkg) -->
-		<script src="https://unpkg.com/@mediapipe/hands@0.4.1646424915/hands.js"></script>
-		<script src="https://unpkg.com/@mediapipe/camera_utils@0.4.1646424915/camera_utils.js"></script>
-		<script src="https://unpkg.com/@mediapipe/drawing_utils@0.4.1646424915/drawing_utils.js"></script>
+		<!-- MediaPipe resources (prefer local ./mediapipe/ copies to avoid CORS/tracking blocks) -->
+		<script src="./mediapipe/hands.js"></script>
+		<script src="./mediapipe/camera_utils.js"></script>
+		<script src="./mediapipe/drawing_utils.js"></script>
 
 		<script type="module">
 			// Import three.js as an ES module so we avoid using deprecated builds
@@ -84,37 +86,54 @@
 			let MEDIAPIPE_ASSET_BASE = null;
 
 			async function ensureMediaPipeReady(){
-				// Try fetching key assets from a local 'mediapipe' directory first to avoid CORS issues when fetching wasm from unpkg
-				const localBase = './mediapipe/';
-				const remoteBase = `https://unpkg.com/@mediapipe/hands@${MEDIAPIPE_VERSION}/`;
-				const list = ['hands.js','hands_solution_packed_assets.data','hands_cpu.wasm'];
-				let progress = 0;
-				setLoading(5, '预热下载...');
-				let foundLocal = 0;
-				for(const f of list){
-					try{
-						setLoading(progress+5, `Checking local ${f}`);
-						const r = await fetch(localBase + f, {method:'HEAD'});
-						if(r.ok) foundLocal++;
-					}catch(e){ /* ignore - file not available locally */ }
+							// Prefer local ./mediapipe/ files (this avoids CORS problems with WASM on some CDNs).
+							const localBase = './mediapipe/';
+							const remoteCandidates = [
+								`https://unpkg.com/@mediapipe/hands@${MEDIAPIPE_VERSION}/`,
+								`https://cdn.jsdelivr.net/npm/@mediapipe/hands@${MEDIAPIPE_VERSION}/`
+							];
+							const list = ['hands.js','hands_solution_packed_assets.data','hands_cpu.wasm'];
+							setLoading(5, '预热下载...');
 
-					try{
-						setLoading(progress+5, `Fetching remote ${f}`);
-						// attempt to download HEAD/content from remote to verify availability.
-						const res = await fetch(remoteBase + f, {method:'GET'});
-						if(!res.ok) throw new Error('资源无法获取: '+f);
-					}catch(err){
-						console.warn('准备资源失败', f, err);
-						// If an asset can't be fetched, continue — Hands constructor will try again.
-					}
-					progress += 30;
-				}
-				// If most assets found locally, prefer local assets to avoid CORS and speed up load
-				MEDIAPIPE_ASSET_BASE = (foundLocal >= 2) ? localBase : remoteBase;
+							// Quick local check (HEAD requests). If at least two assets exist locally we prefer local files.
+							let foundLocal = 0;
+							for(const f of list){
+								try{ const r = await fetch(localBase + f, {method:'HEAD'}); if(r.ok) foundLocal++; }catch(e){ /* ignore */ }
+							}
+							if(foundLocal >= 2){
+								MEDIAPIPE_ASSET_BASE = localBase;
+								setLoading(100,'本地模型资源已就绪 — 使用 ./mediapipe/');
+								await new Promise(r => setTimeout(r, 400));
+								return;
+							}
 
-				setLoading(100,'模型资源准备完毕 — 准备启动摄像头');
-				await new Promise(r => setTimeout(r, 400));
-			}
+							// No/partial local assets found -> try remote CDNs (some CDNs block wasm via CORS). Try candidates in order and pick the first that returns OK.
+							let chosenRemote = null; let progress = 0;
+							for(const candidate of remoteCandidates){
+								try{
+									setLoading(Math.min(90, progress + 10), `Checking remote CDN availability: ${candidate}`);
+									// Try fetching the wasm file using CORS mode; if the CDN blocks cross-origin access this will throw or fail
+									const res = await fetch(candidate + 'hands_cpu.wasm', {method:'GET', mode:'cors'});
+									if(res.ok){ chosenRemote = candidate; break; }
+								}catch(e){
+									console.warn('Remote CDN check failed for', candidate, e);
+								}
+								progress += 40;
+							}
+
+							if(chosenRemote){
+								MEDIAPIPE_ASSET_BASE = chosenRemote;
+								setLoading(100, '使用可访问的 CDN 加载模型（远端）');
+							}else{
+								// Nothing usable remotely; ask the user to download assets to ./mediapipe.
+								MEDIAPIPE_ASSET_BASE = localBase;
+								setLoading(100,'无法直接从 CDN 获取 WASM（CORS 限制）。请运行脚本 scripts/fetch_mediapipe_assets.ps1 将资产保存至 ./mediapipe/');
+								// show more visible message to user
+								status.textContent = '无法从 CDN 获取 WASM；请在项目根目录运行 scripts/fetch_mediapipe_assets.ps1 下载必需文件到 ./mediapipe/ ，或手动添加这些文件。';
+							}
+
+							await new Promise(r => setTimeout(r, 400));
+						}
 
 			// ==================================================
 			// Begin main application lifecycle (async to await models)
@@ -191,13 +210,14 @@
 						scene.add(m); enemies.push(m);
 						updateHUD();
 					}
-					for(let i=0;i<MAX_ENEMIES;i++) spawnEnemy();
 
-					// HUD helpers
+					// HUD helpers — keep references before spawn logic runs so updateHUD is safe
 					const scoreVal = document.getElementById('scoreVal');
 					const enemyCount = document.getElementById('enemyCount');
 					let score = 0;
 					function updateHUD(){ enemyCount.textContent = enemies.length; scoreVal.textContent = score; }
+
+					for(let i=0;i<MAX_ENEMIES;i++) spawnEnemy();
 
 					// Sound assets (small inlined audio beeps) using WebAudio
 					const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
