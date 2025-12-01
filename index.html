@@ -3,8 +3,7 @@
 	<head>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width,initial-scale=1" />
-		<title>AR 手势射击（单文件）</title>
-		<!-- small inline SVG favicon to avoid 404 on /favicon.ico -->
+		<title>AR 手势射击（修复版）</title>
 		<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%230b84ff'/%3E%3Ctext x='50%25' y='55%25' font-size='9' text-anchor='middle' fill='white' font-family='system-ui,Segoe UI,Arial'%3EAR%3C/text%3E%3C/svg%3E">
 		<style>
 			html,body{height:100%;margin:0;overflow:hidden;background:#111;color:#fff;font-family:system-ui,Segoe UI,Arial}
@@ -23,17 +22,19 @@
 			.floatingText{position:absolute;font-weight:700;text-shadow:0 2px 12px #0008;font-size:28px;opacity:1;transform:translate(-50%,-50%) translateY(0);transition:transform 700ms ease-out,opacity 700ms}
 			#debug{position:fixed;right:16px;top:16px;color:#aab8ff66;font-size:12px;z-index:5}
 			button{background:#0b84ff;border:none;color:white;padding:8px 12px;border-radius:8px;font-weight:600}
+			#errorMessage{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:#ff4444;padding:20px;border-radius:8px;z-index:100;max-width:80%}
 		</style>
 	</head>
 	<body>
 		<div id="container"></div>
 
-		<div id="overlay" aria-hidden>
+		<div id="overlay">
 			<div id="loadingCard">
 				<div style="font-size:18px;font-weight:700">加载中 — 初始化模型和资源</div>
 				<div id="progress"><i></i></div>
-				<div id="status">准备下载 MediaPipe Hands (锁定版本: 0.4.1646424915)</div>
+				<div id="status">准备下载 MediaPipe Hands...</div>
 				<div class="hint">请允许摄像头权限 — 下载完毕后自动进入游戏。</div>
+				<button id="retryBtn" style="display:none;margin-top:10px" onclick="window.location.reload()">重试</button>
 			</div>
 		</div>
 
@@ -52,349 +53,574 @@
 
 		<div id="msgLayer"></div>
 		<div id="debug"></div>
+		<div id="errorMessage" style="display:none"></div>
 
-		<!-- Three.js (stable pinned) -->
-		<!-- NOTE: build/three.min.js is deprecated in r150+. We will import the ES module version inside the main app script. -->
-
-		<!-- MediaPipe resources (prefer local ./mediapipe/ copies to avoid CORS/tracking blocks) -->
-		<script src="./mediapipe/hands.js"></script>
-		<script src="./mediapipe/camera_utils.js"></script>
-		<script src="./mediapipe/drawing_utils.js"></script>
+		<script src="https://unpkg.com/@mediapipe/hands@0.4.1646424915/hands.js"></script>
+		<script src="https://unpkg.com/@mediapipe/camera_utils@0.3.1646425229/camera_utils.js"></script>
+		<script src="https://unpkg.com/@mediapipe/drawing_utils@0.3.1646425229/drawing_utils.js"></script>
 
 		<script type="module">
-			// Import three.js as an ES module so we avoid using deprecated builds
 			import * as THREE from 'https://unpkg.com/three@0.152.2/build/three.module.js';
-			// ==========================
-			// Configuration / constants
-			// ==========================
+			
+			// Configuration
 			const MAX_ENEMIES = 4;
-			const AI_DETECTION_HZ = 12; // limit detections to 12/sec (throttled)
+			const AI_DETECTION_HZ = 10;
 			const MEDIAPIPE_VERSION = '0.4.1646424915';
 
-			// ===============
-			// UI helpers
-			// ===============
+			// UI Elements
 			const overlay = document.getElementById('overlay');
-			const prog = document.querySelector('#progress > i');
-			const status = document.getElementById('status');
-			function setLoading(progressPct, text){ prog.style.width = progressPct + '%'; if(text) status.textContent = text; }
+			const progressBar = document.querySelector('#progress > i');
+			const statusText = document.getElementById('status');
+			const retryBtn = document.getElementById('retryBtn');
+			const errorMessage = document.getElementById('errorMessage');
+			
+			// Game State
+			let score = 0;
+			let enemies = [];
+			let lastDetectionTime = 0;
+			let firingLocked = false;
+			let shouldRender = true;
+			let mediaPipeReady = false;
 
-			// ====================
-			// Safety: wait model
-			// ====================
-			// Base used by MediaPipe locateFile; prefer local ./mediapipe/ directory (avoid CORS), otherwise fall back to unpkg
-			let MEDIAPIPE_ASSET_BASE = null;
+			// Three.js Objects
+			let scene, camera, renderer, reticle, laser, videoTexture, bgMesh;
 
-			async function ensureMediaPipeReady(){
-							// Prefer local ./mediapipe/ files (this avoids CORS problems with WASM on some CDNs).
-							const localBase = './mediapipe/';
-							const remoteCandidates = [
-								`https://unpkg.com/@mediapipe/hands@${MEDIAPIPE_VERSION}/`,
-								`https://cdn.jsdelivr.net/npm/@mediapipe/hands@${MEDIAPIPE_VERSION}/`
-							];
-							const list = ['hands.js','hands_solution_packed_assets.data','hands_cpu.wasm'];
-							setLoading(5, '预热下载...');
+			// MediaPipe Objects
+			let hands, cameraUtils, video;
 
-							// Quick local check (HEAD requests). If at least two assets exist locally we prefer local files.
-							let foundLocal = 0;
-							for(const f of list){
-								try{ const r = await fetch(localBase + f, {method:'HEAD'}); if(r.ok) foundLocal++; }catch(e){ /* ignore */ }
-							}
-							if(foundLocal >= 2){
-								MEDIAPIPE_ASSET_BASE = localBase;
-								setLoading(100,'本地模型资源已就绪 — 使用 ./mediapipe/');
-								await new Promise(r => setTimeout(r, 400));
-								return;
-							}
+			// Set loading progress
+			function setLoading(progressPct, text) {
+				progressBar.style.width = `${progressPct}%`;
+				if (text) statusText.textContent = text;
+			}
 
-							// No/partial local assets found -> try remote CDNs (some CDNs block wasm via CORS). Try candidates in order and pick the first that returns OK.
-							let chosenRemote = null; let progress = 0;
-							for(const candidate of remoteCandidates){
-								try{
-									setLoading(Math.min(90, progress + 10), `Checking remote CDN availability: ${candidate}`);
-									// Try fetching the wasm file using CORS mode; if the CDN blocks cross-origin access this will throw or fail
-									const res = await fetch(candidate + 'hands_cpu.wasm', {method:'GET', mode:'cors'});
-									if(res.ok){ chosenRemote = candidate; break; }
-								}catch(e){
-									console.warn('Remote CDN check failed for', candidate, e);
-								}
-								progress += 40;
-							}
+			// Show error message
+			function showError(message) {
+				errorMessage.textContent = message;
+				errorMessage.style.display = 'block';
+				retryBtn.style.display = 'block';
+				setLoading(100, '错误：' + message);
+				console.error(message);
+			}
 
-							if(chosenRemote){
-								MEDIAPIPE_ASSET_BASE = chosenRemote;
-								setLoading(100, '使用可访问的 CDN 加载模型（远端）');
-							}else{
-								// Nothing usable remotely; ask the user to download assets to ./mediapipe.
-								MEDIAPIPE_ASSET_BASE = localBase;
-								setLoading(100,'无法直接从 CDN 获取 WASM（CORS 限制）。请运行脚本 scripts/fetch_mediapipe_assets.ps1 将资产保存至 ./mediapipe/');
-								// show more visible message to user
-								status.textContent = '无法从 CDN 获取 WASM；请在项目根目录运行 scripts/fetch_mediapipe_assets.ps1 下载必需文件到 ./mediapipe/ ，或手动添加这些文件。';
-							}
-
-							await new Promise(r => setTimeout(r, 400));
-						}
-
-			// ==================================================
-			// Begin main application lifecycle (async to await models)
-			// ==================================================
-			(async function main(){
-				try{
-					// Ensure MediaPipe assets reachable (blocking to prevent WASM mismatch crashes)
-					await ensureMediaPipeReady();
-
-					// Camera setup
-					status.textContent = '请求摄像头权限...';
-					let stream;
-					try{
-						stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}, audio:false});
-					}catch(deviceErr){
-						console.error('Camera acquisition failed', deviceErr);
-						// Provide a clear user message rather than letting a raw NotFoundError bubble up
-						document.getElementById('status').textContent = '无法访问摄像头 — 请检查摄像头是否连接并允许权限。';
-						setLoading(100,'需要摄像头才能运行');
-						// hide the overlay only after user acknowledges, but for now stop startup
-						return;
-					}
-
-					// create a hidden video element
-					const video = document.createElement('video');
-					video.autoplay = true; video.playsInline = true; video.muted = true;
-					video.srcObject = stream;
-					await new Promise(r => video.addEventListener('loadeddata',r,{once:true}));
-
-					// Setup Three.js renderer
-					const container = document.getElementById('container');
-					const renderer = new THREE.WebGLRenderer({alpha:true,antialias:true});
+			// Initialize Three.js
+			function initThreeJS() {
+				try {
+					// Create renderer
+					renderer = new THREE.WebGLRenderer({ 
+						alpha: true, 
+						antialias: true,
+						powerPreference: "high-performance"
+					});
 					renderer.setSize(window.innerWidth, window.innerHeight);
-					renderer.setPixelRatio(Math.min(window.devicePixelRatio||1, 1.5));
-					container.appendChild(renderer.domElement);
+					renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+					renderer.setClearColor(0x000000, 0);
+					document.getElementById('container').appendChild(renderer.domElement);
 
-					window.addEventListener('resize', ()=>{ renderer.setSize(window.innerWidth,window.innerHeight); camera.aspect = window.innerWidth/window.innerHeight; camera.updateProjectionMatrix(); });
+					// Create scene
+					scene = new THREE.Scene();
 
-					// Create scene & camera
-					const scene = new THREE.Scene();
-					const camera = new THREE.PerspectiveCamera(70,window.innerWidth/window.innerHeight,0.01,2000);
-					camera.position.set(0,0,12);
+					// Create camera
+					camera = new THREE.PerspectiveCamera(
+						70, 
+						window.innerWidth / window.innerHeight, 
+						0.01, 
+						2000
+					);
+					camera.position.set(0, 0, 12);
 
-					// Add a subtle background plane textured with webcam
-					const videoTexture = new THREE.VideoTexture(video);
-					videoTexture.minFilter = THREE.LinearFilter; videoTexture.magFilter = THREE.LinearFilter; videoTexture.format = THREE.RGBAFormat;
-					const bgMat = new THREE.MeshBasicMaterial({map: videoTexture, toneMapped:false});
-					const bgGeo = new THREE.PlaneGeometry(window.innerWidth/window.innerHeight*16, 16);
-					const bgMesh = new THREE.Mesh(bgGeo,bgMat);
-					bgMesh.position.set(0,0,-10);
+					// Create reticle (aiming circle)
+					reticle = new THREE.Mesh(
+						new THREE.RingGeometry(0.2, 0.35, 32), 
+						new THREE.MeshBasicMaterial({ 
+							color: 0xff0055, 
+							side: THREE.DoubleSide,
+							transparent: true,
+							opacity: 0.8
+						})
+					);
+					reticle.rotation.x = -Math.PI / 2;
+					reticle.position.z = 0;
+					scene.add(reticle);
+
+					// Create laser
+					const laserMaterial = new THREE.LineBasicMaterial({ 
+						color: 0xff0055,
+						linewidth: 2 
+					});
+					const laserGeometry = new THREE.BufferGeometry().setFromPoints([
+						new THREE.Vector3(0, 0, 10),
+						new THREE.Vector3(0, 0, 0)
+					]);
+					laser = new THREE.Line(laserGeometry, laserMaterial);
+					scene.add(laser);
+
+					// Handle window resize
+					window.addEventListener('resize', () => {
+						camera.aspect = window.innerWidth / window.innerHeight;
+						camera.updateProjectionMatrix();
+						renderer.setSize(window.innerWidth, window.innerHeight);
+						if (bgMesh) {
+							bgMesh.scale.set(window.innerWidth / window.innerHeight * 16, 16, 1);
+						}
+					});
+
+					return true;
+				} catch (error) {
+					showError('Three.js初始化失败: ' + error.message);
+					return false;
+				}
+			}
+
+			// Initialize video and camera
+			async function initCamera() {
+				try {
+					setLoading(20, '请求摄像头权限...');
+					
+					// Create video element
+					video = document.createElement('video');
+					video.autoplay = true;
+					video.playsInline = true;
+					video.muted = true;
+
+					// Get camera stream
+					const stream = await navigator.mediaDevices.getUserMedia({
+						video: {
+							facingMode: 'environment',
+							width: { ideal: 1280 },
+							height: { ideal: 720 }
+						},
+						audio: false
+					});
+
+					video.srcObject = stream;
+					
+					// Wait for video to load
+					await new Promise(resolve => {
+						video.addEventListener('loadeddata', resolve, { once: true });
+					});
+
+					// Create video background
+					videoTexture = new THREE.VideoTexture(video);
+					videoTexture.minFilter = THREE.LinearFilter;
+					videoTexture.magFilter = THREE.LinearFilter;
+					videoTexture.format = THREE.RGBAFormat;
+
+					const bgMat = new THREE.MeshBasicMaterial({ 
+						map: videoTexture, 
+						toneMapped: false 
+					});
+					const bgGeo = new THREE.PlaneGeometry(
+						window.innerWidth / window.innerHeight * 16, 
+						16
+					);
+					bgMesh = new THREE.Mesh(bgGeo, bgMat);
+					bgMesh.position.set(0, 0, -10);
 					scene.add(bgMesh);
 
-					// Reticle and UI objects
-					const reticle = new THREE.Mesh(new THREE.RingGeometry(0.2,0.35,32), new THREE.MeshBasicMaterial({color:0xfffa, side:THREE.DoubleSide}));
-					reticle.rotation.x = Math.PI/2; reticle.position.z = 0; scene.add(reticle);
+					setLoading(40, '摄像头初始化成功');
+					return true;
+				} catch (error) {
+					showError('摄像头初始化失败: ' + error.message);
+					return false;
+				}
+			}
 
-					// Laser line
-					const laserMaterial = new THREE.LineBasicMaterial({color:0xff0055,linewidth:2});
-					const laserGeometry = new THREE.BufferGeometry().setFromPoints([ new THREE.Vector3(), new THREE.Vector3() ]);
-					const laser = new THREE.Line(laserGeometry, laserMaterial); scene.add(laser);
+			// Initialize MediaPipe Hands
+			async function initMediaPipe() {
+				try {
+					setLoading(60, '初始化手部追踪模型...');
 
-					// Enemies container
-					const enemies = [];
-					const enemyGeo = new THREE.CircleGeometry(0.6,32);
-					function spawnEnemy(){
-						// spawn at random edge position and fly toward center
-						const angle = Math.random()*Math.PI*2;
-						const radius = 10 + Math.random()*2;
-						const x = Math.cos(angle)*radius; const y = Math.sin(angle)*radius;
-						const mat = new THREE.MeshBasicMaterial({color: new THREE.Color(`hsl(${Math.random()*60+0},80%,60%)`),opacity:0.95,transparent:true});
-						const m = new THREE.Mesh(enemyGeo, mat);
-						m.position.set(x,y,0);
-						m.userData = {vel: new THREE.Vector3(-x*0.004 - Math.random()*0.002, -y*0.004 - Math.random()*0.002, 0), hp:1};
-						scene.add(m); enemies.push(m);
-						updateHUD();
-					}
-
-					// HUD helpers — keep references before spawn logic runs so updateHUD is safe
-					const scoreVal = document.getElementById('scoreVal');
-					const enemyCount = document.getElementById('enemyCount');
-					let score = 0;
-					function updateHUD(){ enemyCount.textContent = enemies.length; scoreVal.textContent = score; }
-
-					for(let i=0;i<MAX_ENEMIES;i++) spawnEnemy();
-
-					// Sound assets (small inlined audio beeps) using WebAudio
-					const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-					function playTone(freq=700, duration=0.08, gainVal=0.4){
-						const o = audioCtx.createOscillator(); const g = audioCtx.createGain(); o.type='sine'; o.frequency.value = freq; g.gain.value = gainVal;
-						o.connect(g); g.connect(audioCtx.destination); o.start(); o.stop(audioCtx.currentTime+duration);
-					}
-
-					// Message floating effect
-					const msgLayer = document.getElementById('msgLayer');
-					function floatingText(text,x,y,cls='hit'){
-						const t = document.createElement('div'); t.className='floatingText '+cls; t.style.left=(x*100)+'%'; t.style.top=(y*100)+'%'; t.textContent=text; msgLayer.appendChild(t);
-						requestAnimationFrame(()=>{ t.style.transform='translate(-50%,-50%) translateY(-40px)'; t.style.opacity='0'; });
-						setTimeout(()=>t.remove(),800);
-					}
-
-					// Aim snapping (magnet) parameters
-					const magnetRadius = 0.9; // snapping distance (world units)
-
-					// Gesture detection state
-					let lastDetectionTime = 0;
-					let lastIndexPos = null;
-					let firingLocked = false; // prevents auto-repeat
-
-					// FPS tracking
-					let lastFrameTime = performance.now(); let fpsCounter=0, fpsTimer=performance.now();
-
-					// Setup MediaPipe Hands
-					// The library was loaded from unpkg; ensure locateFile points to same version
-					const hands = new Hands({
-						locateFile: (file) => `${MEDIAPIPE_ASSET_BASE}${file}`
+					// Initialize MediaPipe Hands
+					hands = new Hands({
+						locateFile: (file) => {
+							return `https://unpkg.com/@mediapipe/hands@${MEDIAPIPE_VERSION}/${file}`;
+						}
 					});
 
 					hands.setOptions({
 						maxNumHands: 1,
 						modelComplexity: 0,
-						minDetectionConfidence: 0.6,
-						minTrackingConfidence: 0.5
+						minDetectionConfidence: 0.7,
+						minTrackingConfidence: 0.6,
+						selfieMode: true
 					});
 
-					// Protect the detection loop with try/catch
-					let lastResult = null;
-					hands.onResults(results => {
-						lastResult = results;
+					// Store last results
+					let lastResults = null;
+					hands.onResults((results) => {
+						lastResults = results;
 					});
 
-					// create a MediaPipe camera util for pulling frames
-					const cameraUtils = new Camera(video, {
+					// Initialize camera utils
+					cameraUtils = new Camera(video, {
 						onFrame: async () => {
-							// Throttle detection frequency
-							const now = performance.now();
-							if(now - lastDetectionTime > (1000 / AI_DETECTION_HZ)){
-								lastDetectionTime = now;
-								try{
-									await hands.send({image: video});
-								}catch(e){
-									console.error('MediaPipe hands send failed — recovered safely', e);
+							if (mediaPipeReady && Date.now() - lastDetectionTime > (1000 / AI_DETECTION_HZ)) {
+								lastDetectionTime = Date.now();
+								try {
+									await hands.send({ image: video });
+								} catch (error) {
+									console.warn('MediaPipe发送帧失败:', error);
 								}
 							}
 						},
-						width: 640, height: 480
+						width: 640,
+						height: 480
 					});
-					cameraUtils.start();
 
-					// Loading overlay hide once we see at least one frames processed
-					let seenMpInit = false;
-					const mpInitTimeout = setTimeout(()=>{ // safety: if MediaPipe does not produce results, still allow the game after 10s
-						if(!seenMpInit){ overlay.style.display='none'; }
-					}, 10000);
+					await cameraUtils.start();
+					mediaPipeReady = true;
 
-					// Main render loop
-					function animate(){
-						requestAnimationFrame(animate);
+					setLoading(80, '手部追踪模型初始化完成');
+					return lastResults;
+				} catch (error) {
+					showError('MediaPipe初始化失败: ' + error.message);
+					return null;
+				}
+			}
 
-						// FPS calc
-						const t = performance.now(); fpsCounter++; if(t - fpsTimer >= 1000){ document.getElementById('fps').textContent = Math.round(fpsCounter*1000/(t-fpsTimer)); fpsTimer = t; fpsCounter = 0; }
+			// Spawn enemy
+			function spawnEnemy() {
+				if (enemies.length >= MAX_ENEMIES) return;
 
-						// Move enemies
-						for(let i=enemies.length-1;i>=0;i--){
-							const e = enemies[i]; e.position.addScaledVector(e.userData.vel, 1);
-							// If near center, bump score negative as missed
-							if(e.position.length() < 0.6){
-								scene.remove(e); enemies.splice(i,1);
-								score = Math.max(0, score-5);
-								floatingText('MISS', 50 + (Math.random()*10-5), 50 + (Math.random()*10-5));
-								playTone(180,0.12,0.25);
-							}
-						}
+				const angle = Math.random() * Math.PI * 2;
+				const radius = 10 + Math.random() * 5;
+				const x = Math.cos(angle) * radius;
+				const y = Math.sin(angle) * radius;
 
-						// refill enemies
-						while(enemies.length < MAX_ENEMIES) spawnEnemy();
+				const enemyGeo = new THREE.CircleGeometry(0.6, 32);
+				const mat = new THREE.MeshBasicMaterial({
+					color: new THREE.Color(`hsl(${Math.random() * 360}, 80%, 60%)`),
+					opacity: 0.95,
+					transparent: true
+				});
 
-						// Gesture & aiming
-						if(lastResult && lastResult.multiHandLandmarks && lastResult.multiHandLandmarks.length){
-							seenMpInit = true; overlay.style.display='none'; clearTimeout(mpInitTimeout);
-							const lm = lastResult.multiHandLandmarks[0];
+				const enemy = new THREE.Mesh(enemyGeo, mat);
+				enemy.position.set(x, y, 0);
+				enemy.userData = {
+					vel: new THREE.Vector3(
+						-x * (0.004 + Math.random() * 0.002),
+						-y * (0.004 + Math.random() * 0.002),
+						0
+					),
+					hp: 1
+				};
 
-							// Extract index fingertip and thumb tip
-							const idx = lm[8]; // normalized coords
-							const thumb = lm[4];
+				scene.add(enemy);
+				enemies.push(enemy);
+				updateHUD();
+			}
 
-							// convert normalized coordinates into 3D world aiming plane
-							// normalized coords: x [0,1] left->right, y [0,1] top->bottom
-							const aimX = (idx.x - 0.5) * (window.innerWidth/window.innerHeight) * 12;
-							const aimY = -(idx.y - 0.5) * 12;
-							const aimPos = new THREE.Vector3(aimX, aimY, 0);
+			// Update HUD
+			function updateHUD() {
+				document.getElementById('scoreVal').textContent = score;
+				document.getElementById('enemyCount').textContent = enemies.length;
+			}
 
-							// Magnet: snap reticle to nearest enemy within magnetRadius
-							let snapped = null; let nearest = Infinity;
-							enemies.forEach(e => { const d = e.position.distanceTo(aimPos); if(d < nearest){ nearest = d; snapped = e; }});
-							if(nearest < magnetRadius){ reticle.position.copy(snapped.position); } else { reticle.position.copy(aimPos); }
+			// Play sound effect
+			const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+			function playSound(type) {
+				try {
+					const oscillator = audioCtx.createOscillator();
+					const gainNode = audioCtx.createGain();
 
-							// Draw laser: from camera to reticle
-							const p1 = new THREE.Vector3(0,0,10); const p2 = new THREE.Vector3(reticle.position.x, reticle.position.y, 0);
-							laser.geometry.setFromPoints([p1,p2]);
+					oscillator.connect(gainNode);
+					gainNode.connect(audioCtx.destination);
 
-							// Gesture detection: detect 'pistol' (index extended, others folded) + thumb tap to produce shoot
-							// Simple heuristics: index tip is further from wrist than PIP (landmark 6); finger curl by comparing distances
-							function isIndexExtended(){
-								const indexDist = Math.hypot(lm[8].x - lm[0].x, lm[8].y - lm[0].y);
-								const pipDist = Math.hypot(lm[6].x - lm[0].x, lm[6].y - lm[0].y);
-								return indexDist > pipDist + 0.01;
-							}
-							function areOtherFingersCurled(){
-								// middle, ring, pinky tips closer to wrist than their pips
-								const isCurled = (tip,pip)=> (Math.hypot(lm[tip].x-lm[0].x,lm[tip].y-lm[0].y) < Math.hypot(lm[pip].x-lm[0].x,lm[pip].y-lm[0].y)+0.015);
-								return isCurled(12,10) && isCurled(16,14) && isCurled(20,18);
-							}
-							function thumbNearIndex(){
-								// small euclidean distance between tip and index tip
-								const d = Math.hypot(idx.x - thumb.x, idx.y - thumb.y);
-								return d < 0.055; // tuned threshold
-							}
+					switch(type) {
+						case 'shoot':
+							oscillator.type = 'sine';
+							oscillator.frequency.value = 700;
+							gainNode.gain.value = 0.2;
+							oscillator.start();
+							gainNode.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.1);
+							oscillator.stop(audioCtx.currentTime + 0.1);
+							break;
+						case 'hit':
+							oscillator.type = 'sine';
+							oscillator.frequency.value = 1200;
+							gainNode.gain.value = 0.3;
+							oscillator.start();
+							gainNode.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.08);
+							oscillator.stop(audioCtx.currentTime + 0.08);
+							break;
+						case 'miss':
+							oscillator.type = 'sine';
+							oscillator.frequency.value = 300;
+							gainNode.gain.value = 0.2;
+							oscillator.start();
+							gainNode.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.1);
+							oscillator.stop(audioCtx.currentTime + 0.1);
+							break;
+					}
+				} catch (error) {
+					console.warn('Audio error:', error);
+				}
+			}
 
-							const pistolPose = isIndexExtended() && areOtherFingersCurled();
+			// Show floating text
+			function showFloatingText(text, x, y) {
+				const msgLayer = document.getElementById('msgLayer');
+				const textElement = document.createElement('div');
+				textElement.className = 'floatingText';
+				textElement.textContent = text;
+				textElement.style.left = `${x}%`;
+				textElement.style.top = `${y}%`;
+				textElement.style.color = text === 'HIT' ? '#4CAF50' : '#FF5252';
+				
+				msgLayer.appendChild(textElement);
+				
+				setTimeout(() => {
+					textElement.style.transform = 'translate(-50%, -50%) translateY(-40px)';
+					textElement.style.opacity = '0';
+				}, 10);
+				
+				setTimeout(() => {
+					msgLayer.removeChild(textElement);
+				}, 800);
+			}
 
-							if(pistolPose && thumbNearIndex()){
-								// fire
-								if(!firingLocked){
-									firingLocked = true; setTimeout(()=>{firingLocked=false;}, 160); // small debouncing
-									// check hit on snapped or near enemies
-									if(nearest < magnetRadius){ // hit
-										snapped.userData.hp -= 1; if(snapped.userData.hp <= 0){
-											// remove
-											scene.remove(snapped); const idxp = enemies.indexOf(snapped); if(idxp>=0) enemies.splice(idxp,1);
-											score += 10; playTone(1200,0.06,0.55); floatingText('HIT', 50 + (Math.random()*10-5), 45 + (Math.random()*10-10));
-										}
-									} else {
-										// miss
-										playTone(300,0.08,0.4); floatingText('MISS', 50 + (Math.random()*10-5), 55 + (Math.random()*8-4));
-									}
-								}
-							}
-						}
+			// Main game loop
+			function gameLoop() {
+				if (!shouldRender) return;
 
-						renderer.render(scene,camera);
+				requestAnimationFrame(gameLoop);
+
+				// Update FPS counter
+				updateFPS();
+
+				// Update enemies
+				updateEnemies();
+
+				// Process hand tracking
+				processHandTracking();
+
+				// Render scene
+				if (renderer && scene && camera) {
+					renderer.render(scene, camera);
+				}
+			}
+
+			// FPS counter
+			let fpsCounter = 0;
+			let fpsTime = performance.now();
+			function updateFPS() {
+				fpsCounter++;
+				const now = performance.now();
+				
+				if (now - fpsTime >= 1000) {
+					const fps = Math.round(fpsCounter * 1000 / (now - fpsTime));
+					document.getElementById('fps').textContent = fps;
+					fpsCounter = 0;
+					fpsTime = now;
+				}
+			}
+
+			// Update enemy positions
+			function updateEnemies() {
+				for (let i = enemies.length - 1; i >= 0; i--) {
+					const enemy = enemies[i];
+					
+					// Move enemy
+					enemy.position.add(enemy.userData.vel);
+					
+					// Check if enemy reached center
+					if (enemy.position.length() < 0.8) {
+						// Remove enemy
+						scene.remove(enemy);
+						enemies.splice(i, 1);
+						
+						// Decrease score
+						score = Math.max(0, score - 5);
+						showFloatingText('MISS', 50 + (Math.random() * 10 - 5), 50 + (Math.random() * 10 - 5));
+						playSound('miss');
 						updateHUD();
 					}
-
-					// start animation after a short warm-up
-					requestAnimationFrame(animate);
-
-					// Slightly longer hiding to make sure everything warmed up
-					setTimeout(()=>{ if(!overlay.style.display) overlay.style.display='none'; }, 6000);
-
-				}catch(err){
-					console.error('游戏启动失败',err);
-					document.getElementById('status').textContent = '启动失败：' + (err.message||err);
-					setLoading(100,'失败 – 请检查浏览器控制台');
 				}
-			})();
 
-			// Keep a heartbeat to ensure overlay progress moves even if asset fetches take time
-			(function progressPulse(){
-				let pct=10; setInterval(()=>{ pct = Math.min(100, pct + Math.random()*8); prog.style.width = pct + '%'; }, 500);
-			})();
+				// Spawn new enemies if needed
+				while (enemies.length < MAX_ENEMIES) {
+					spawnEnemy();
+				}
+			}
 
+			// Process hand tracking data
+			function processHandTracking() {
+				if (!hands || !mediaPipeReady) return;
+
+				hands.onResults(results => {
+					if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+						const landmarks = results.multiHandLandmarks[0];
+						
+						// Get key landmarks
+						const indexTip = landmarks[8];
+						const thumbTip = landmarks[4];
+						const wrist = landmarks[0];
+
+						// Convert normalized coordinates to game space
+						const aimX = (indexTip.x - 0.5) * (window.innerWidth / window.innerHeight) * 12;
+						const aimY = -(indexTip.y - 0.5) * 12;
+
+						// Update reticle position
+						const aimPosition = new THREE.Vector3(aimX, aimY, 0);
+						
+						// Magnet effect - snap to nearest enemy
+						const magnetRadius = 1.2;
+						let nearestEnemy = null;
+						let nearestDistance = Infinity;
+
+						enemies.forEach(enemy => {
+							const distance = enemy.position.distanceTo(aimPosition);
+							if (distance < nearestDistance) {
+								nearestDistance = distance;
+								nearestEnemy = enemy;
+							}
+						});
+
+						// Update reticle position
+						if (nearestEnemy && nearestDistance < magnetRadius) {
+							reticle.position.copy(nearestEnemy.position);
+						} else {
+							reticle.position.copy(aimPosition);
+						}
+
+						// Update laser
+						laser.geometry.setFromPoints([
+							new THREE.Vector3(0, 0, 10),
+							reticle.position
+						]);
+
+						// Detect shooting gesture
+						const isShooting = detectShootingGesture(landmarks);
+						
+						if (isShooting && !firingLocked) {
+							firingLocked = true;
+							setTimeout(() => firingLocked = false, 200);
+							
+							playSound('shoot');
+							
+							// Check for hit
+							if (nearestEnemy && nearestDistance < magnetRadius) {
+								// Hit enemy
+								scene.remove(nearestEnemy);
+								const index = enemies.indexOf(nearestEnemy);
+								if (index !== -1) enemies.splice(index, 1);
+								
+								score += 10;
+								showFloatingText('HIT', indexTip.x * 100, indexTip.y * 100);
+								playSound('hit');
+								updateHUD();
+							} else {
+								// Miss
+								showFloatingText('MISS', indexTip.x * 100, indexTip.y * 100);
+								playSound('miss');
+							}
+						}
+
+						// Hide loading overlay
+						if (overlay.style.display !== 'none') {
+							setLoading(100, '准备就绪！');
+							setTimeout(() => {
+								overlay.style.display = 'none';
+							}, 500);
+						}
+					}
+				});
+			}
+
+			// Detect shooting gesture
+			function detectShootingGesture(landmarks) {
+				// Check if index finger is extended
+				const indexExtended = isFingerExtended(landmarks, 8, 6);
+				
+				// Check if other fingers are curled
+				const middleCurled = isFingerCurled(landmarks, 12, 10);
+				const ringCurled = isFingerCurled(landmarks, 16, 14);
+				const pinkyCurled = isFingerCurled(landmarks, 20, 18);
+				
+				// Check if thumb is near index finger
+				const thumbNearIndex = getDistance(landmarks[4], landmarks[8]) < 0.06;
+
+				return indexExtended && middleCurled && ringCurled && pinkyCurled && thumbNearIndex;
+			}
+
+			// Helper: Check if finger is extended
+			function isFingerExtended(landmarks, tipIndex, pipIndex) {
+				const tip = landmarks[tipIndex];
+				const pip = landmarks[pipIndex];
+				const wrist = landmarks[0];
+				
+				const tipDistance = getDistance(tip, wrist);
+				const pipDistance = getDistance(pip, wrist);
+				
+				return tipDistance > pipDistance + 0.02;
+			}
+
+			// Helper: Check if finger is curled
+			function isFingerCurled(landmarks, tipIndex, pipIndex) {
+				const tip = landmarks[tipIndex];
+				const pip = landmarks[pipIndex];
+				const wrist = landmarks[0];
+				
+				const tipDistance = getDistance(tip, wrist);
+				const pipDistance = getDistance(pip, wrist);
+				
+				return tipDistance < pipDistance + 0.01;
+			}
+
+			// Helper: Calculate distance between two landmarks
+			function getDistance(point1, point2) {
+				return Math.hypot(point1.x - point2.x, point1.y - point2.y);
+			}
+
+			// Initialize everything
+			async function init() {
+				try {
+					setLoading(10, '初始化Three.js...');
+					
+					// Initialize Three.js
+					if (!initThreeJS()) return;
+
+					// Initialize camera
+					if (!await initCamera()) return;
+
+					// Initialize MediaPipe
+					const results = await initMediaPipe();
+					if (!results) return;
+
+					// Start game loop
+					setLoading(100, '游戏加载完成！');
+					setTimeout(() => {
+						overlay.style.display = 'none';
+						gameLoop();
+					}, 1000);
+
+				} catch (error) {
+					showError('初始化失败: ' + error.message);
+				}
+			}
+
+			// Start initialization when DOM is loaded
+			document.addEventListener('DOMContentLoaded', init);
+
+			// Handle page visibility
+			document.addEventListener('visibilitychange', () => {
+				shouldRender = !document.hidden;
+				if (shouldRender && renderer) {
+					gameLoop();
+				}
+			});
+
+			// Keep progress bar moving during loading
+			let progress = 0;
+			const progressInterval = setInterval(() => {
+				if (progress < 90 && !mediaPipeReady) {
+					progress += 2;
+					setLoading(progress);
+				} else if (mediaPipeReady) {
+					clearInterval(progressInterval);
+				}
+			}, 500);
 		</script>
 	</body>
 </html>

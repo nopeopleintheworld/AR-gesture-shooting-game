@@ -2,17 +2,20 @@
 
 Quick steps to run this project locally and fix the issues you saw (CORS on wasm + three.js warnings + camera not found):
 
-1) Download MediaPipe assets into a local `mediapipe` folder (recommended, avoids CORS):
+1) MediaPipe assets and behavior
+
+- The app loads `@mediapipe/hands` from unpkg locked to version `0.4.1646424915` by default (this ensures the JS and WASM versions match). If the remote CDN is blocked by the browser (e.g. tracking protection) or the WASM cannot be fetched cross-origin, the app will try to fall back to local files under `./mediapipe/`.
+- To run fully offline (recommended for demos), download the MediaPipe assets into a local `mediapipe` folder (avoids CORS):
 
 PowerShell (from project root):
 ```powershell
 scripts\fetch_mediapipe_assets.ps1
 ```
 
-This will create a `./mediapipe/` folder with three files:
+This will create a `./mediapipe/` folder with the key files used by this demo (file names may vary across versions):
 - hands.js
 - hands_solution_packed_assets.data
-- hands_cpu.wasm
+- hands_solution_wasm_bin.wasm (or other variant the package supplies)
 
 2) Start a static HTTP server in the project root so the browser can load WASM + assets. Examples:
 
